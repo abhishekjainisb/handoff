@@ -64,14 +64,28 @@ export async function createClient() {
 /**
  * Service-role client. NEVER import this from client/browser code or from
  * anything reachable by a plain authenticated request — it bypasses RLS.
- * Used only by: the roster seed script and (later) cron routes guarded by
- * CRON_SECRET.
+ * Used by: the roster seed script, the roster-lookup API route (the roster
+ * table — everyone's email — isn't readable by anon/authenticated roles by
+ * design, so the masked-search endpoint needs elevated access), and later
+ * cron routes guarded by CRON_SECRET.
  */
 export function createServiceClient() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !serviceKey) {
+    console.error(
+      "[handoff] createServiceClient(): missing env — " +
+        `NEXT_PUBLIC_SUPABASE_URL=${url ? "set" : "MISSING"}, ` +
+        `SUPABASE_SERVICE_ROLE_KEY=${serviceKey ? "set" : "MISSING"}. ` +
+        "Get the service_role key from Supabase -> Project Settings -> API " +
+        "-> Project API keys, add it in Vercel as SUPABASE_SERVICE_ROLE_KEY " +
+        "(no NEXT_PUBLIC_ prefix), then redeploy with build cache OFF."
+    );
+    throw new Error(
+      "Supabase service-role client is not configured: SUPABASE_SERVICE_ROLE_KEY " +
+        "is missing. See server logs for where to get it."
+    );
+  }
   const { createClient: createSupabaseClient } = require("@supabase/supabase-js");
-  return createSupabaseClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
+  return createSupabaseClient(url, serviceKey, { auth: { persistSession: false } });
 }
