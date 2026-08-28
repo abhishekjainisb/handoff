@@ -1,22 +1,38 @@
-import { createServerClient, type CookieOptions } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
-type CookieToSet = { name: string; value: string; options?: CookieOptions };
-
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-// Runs once per cold start (module scope, not per-request) — prints exactly
-// what value got baked into this build, no guessing from a Vercel dashboard
-// screenshot. Safe to log: the anon key is public by design, but we print
-// only its length here anyway since the URL alone is enough to diagnose the
-// known failure mode (a stray /rest/v1/ or similar suffix).
-console.log(
-  `[handoff] middleware cold start — NEXT_PUBLIC_SUPABASE_URL="${
-    SUPABASE_URL ?? "(unset)"
-  }", NEXT_PUBLIC_SUPABASE_ANON_KEY length=${SUPABASE_ANON_KEY?.length ?? 0}`
-);
-
+// This file used to import @supabase/ssr and call supabase.auth.getUser()
+// right here in middleware, on the Edge Runtime. That's the standard
+// documented pattern, but on this deployment it repeatedly triggered
+// Vercel's "Edge Function is referencing unsupported modules" build failure
+// even with an up-to-date supabase-js — and switching middleware to the
+// Node.js runtime to route around that hit a *separate*, unresolved
+// Vercel/Next.js bug specific to a custom Root Directory (this repo's
+// setup): the compiled middleware.js ships with ESM `import` syntax but
+// gets loaded as CommonJS at runtime, crashing with "Cannot use import
+// statement outside a module". Two different platform bugs, same repo
+// shape, in two different runtimes.
+//
+// The fix: middleware no longer imports any Supabase package at all, so
+// neither bug can trigger — there is nothing left for Vercel's Edge
+// bundler to flag. It does a cheap, dependency-free check instead: does a
+// Supabase session cookie exist? (@supabase/ssr names it
+// `sb-<project-ref>-auth-token`, optionally split into `-auth-token.0`,
+// `-auth-token.1`, ... for large sessions — matching on the `-auth-token`
+// substring covers both.) That's enough to decide whether to redirect an
+// obviously-logged-out visitor away from a protected page.
+//
+// This is NOT the security boundary — it never fully was. A present
+// cookie isn't cryptographically verified here, so a stale/expired one
+// would pass this check. The actual auth check happens where it always
+// has: lib/supabase/server.ts's createClient().auth.getUser() inside
+// Server Actions and Server Components (see app/actions/items.ts,
+// app/actions/onboarding.ts, etc.), backed by Postgres Row Level Security
+// using auth.uid() on every table (supabase/migrations/0006_rls.sql).
+// Those run in the normal Node.js serverless runtime, not Edge, so they
+// can import Supabase freely with zero risk of this class of bug. This
+// split — cheap routing hint in middleware, real verification in Server
+// Functions/RLS — is also what Next.js's own docs now recommend instead
+// of relying on middleware/Proxy as the security layer.
 function isPublicPath(path: string) {
   return (
     path === "/" ||
@@ -31,94 +47,21 @@ function isPublicPath(path: string) {
   );
 }
 
-// Used only when Supabase can't be reached/configured at all: let public
-// pages render as "logged out" instead of hard-crashing the entire site
-// (every route, public or not, would 500 otherwise), and bounce protected
-// pages to /login rather than showing a raw MIDDLEWARE_INVOCATION_FAILED.
-function middlewareBypass(request: NextRequest) {
-  const path = request.nextUrl.pathname;
-  if (isPublicPath(path)) {
-    return NextResponse.next({ request });
-  }
-  const url = request.nextUrl.clone();
-  url.pathname = "/login";
-  url.searchParams.set("next", path + request.nextUrl.search);
-  return NextResponse.redirect(url);
+function hasSupabaseSessionCookie(request: NextRequest) {
+  return request.cookies
+    .getAll()
+    .some((c) => c.name.startsWith("sb-") && c.name.includes("-auth-token"));
 }
 
-/**
- * Refreshes the Supabase auth session on every request. This is what makes
- * "log in once" actually stick — without it, an expired access token would
- * force a re-login instead of silently refreshing.
- */
 export async function updateSession(request: NextRequest) {
-  let supabaseResponse = NextResponse.next({ request });
+  const path = request.nextUrl.pathname;
 
-  // Fail loud-but-not-fatal: if the env vars are missing or malformed at
-  // runtime, log exactly which one so it shows up in Vercel's Function
-  // Logs, and fail OPEN (treat the visitor as logged out) instead of
-  // throwing and taking down every single page on the site, including
-  // public ones. Remember NEXT_PUBLIC_* values are baked in at BUILD time —
-  // changing them in the Vercel dashboard does nothing until you redeploy
-  // with build cache OFF.
-  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-    console.error(
-      "[handoff] Supabase env vars missing/empty at build time — " +
-        `NEXT_PUBLIC_SUPABASE_URL=${SUPABASE_URL ? "set" : "MISSING"}, ` +
-        `NEXT_PUBLIC_SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY ? "set" : "MISSING"}. ` +
-        "Fix in Vercel -> Settings -> Environment Variables (scope: Production), " +
-        "then redeploy with 'Use existing Build Cache' UNCHECKED."
-    );
-    return middlewareBypass(request);
+  if (!hasSupabaseSessionCookie(request) && !isPublicPath(path)) {
+    const url = request.nextUrl.clone();
+    url.pathname = "/login";
+    url.searchParams.set("next", path + request.nextUrl.search);
+    return NextResponse.redirect(url);
   }
 
-  // Everything below this line can throw for reasons that have nothing to
-  // do with a coding bug — a wrong URL (e.g. a stray /rest/v1/ suffix), a
-  // DNS hiccup, Supabase being briefly unreachable — and `getUser()` makes
-  // a real network call, so a bad value here throws asynchronously, well
-  // after `createServerClient()` itself returns successfully. Wrapping only
-  // the constructor call (as an earlier version of this file did) missed
-  // exactly this case and middleware kept crashing identically. Everything
-  // from client construction through reading the user is now one try block
-  // so NOTHING here can escape and take down the whole site again.
-  try {
-    const supabase = createServerClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll();
-        },
-        setAll(cookiesToSet: CookieToSet[]) {
-          cookiesToSet.forEach(({ name, value }) =>
-            request.cookies.set(name, value)
-          );
-          supabaseResponse = NextResponse.next({ request });
-          cookiesToSet.forEach(({ name, value, options }) =>
-            supabaseResponse.cookies.set(name, value, options ?? {})
-          );
-        },
-      },
-    });
-
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-
-    const path = request.nextUrl.pathname;
-
-    if (!user && !isPublicPath(path)) {
-      const url = request.nextUrl.clone();
-      url.pathname = "/login";
-      url.searchParams.set("next", path + request.nextUrl.search);
-      return NextResponse.redirect(url);
-    }
-
-    return supabaseResponse;
-  } catch (err) {
-    console.error(
-      "[handoff] Supabase call failed in middleware (URL reachable? value " +
-        `correct?) — SUPABASE_URL="${SUPABASE_URL}":`,
-      err
-    );
-    return middlewareBypass(request);
-  }
+  return NextResponse.next({ request });
 }
