@@ -6,6 +6,17 @@ type CookieToSet = { name: string; value: string; options?: CookieOptions };
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
+// Runs once per cold start (module scope, not per-request) — prints exactly
+// what value got baked into this build, no guessing from a Vercel dashboard
+// screenshot. Safe to log: the anon key is public by design, but we print
+// only its length here anyway since the URL alone is enough to diagnose the
+// known failure mode (a stray /rest/v1/ or similar suffix).
+console.log(
+  `[handoff] middleware cold start — NEXT_PUBLIC_SUPABASE_URL="${
+    SUPABASE_URL ?? "(unset)"
+  }", NEXT_PUBLIC_SUPABASE_ANON_KEY length=${SUPABASE_ANON_KEY?.length ?? 0}`
+);
+
 function isPublicPath(path: string) {
   return (
     path === "/" ||
@@ -61,9 +72,17 @@ export async function updateSession(request: NextRequest) {
     return middlewareBypass(request);
   }
 
-  let supabase;
+  // Everything below this line can throw for reasons that have nothing to
+  // do with a coding bug — a wrong URL (e.g. a stray /rest/v1/ suffix), a
+  // DNS hiccup, Supabase being briefly unreachable — and `getUser()` makes
+  // a real network call, so a bad value here throws asynchronously, well
+  // after `createServerClient()` itself returns successfully. Wrapping only
+  // the constructor call (as an earlier version of this file did) missed
+  // exactly this case and middleware kept crashing identically. Everything
+  // from client construction through reading the user is now one try block
+  // so NOTHING here can escape and take down the whole site again.
   try {
-    supabase = createServerClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    const supabase = createServerClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       cookies: {
         getAll() {
           return request.cookies.getAll();
@@ -79,23 +98,27 @@ export async function updateSession(request: NextRequest) {
         },
       },
     });
+
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    const path = request.nextUrl.pathname;
+
+    if (!user && !isPublicPath(path)) {
+      const url = request.nextUrl.clone();
+      url.pathname = "/login";
+      url.searchParams.set("next", path + request.nextUrl.search);
+      return NextResponse.redirect(url);
+    }
+
+    return supabaseResponse;
   } catch (err) {
-    console.error("[handoff] createServerClient() threw in middleware:", err);
+    console.error(
+      "[handoff] Supabase call failed in middleware (URL reachable? value " +
+        `correct?) — SUPABASE_URL="${SUPABASE_URL}":`,
+      err
+    );
     return middlewareBypass(request);
   }
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  const path = request.nextUrl.pathname;
-
-  if (!user && !isPublicPath(path)) {
-    const url = request.nextUrl.clone();
-    url.pathname = "/login";
-    url.searchParams.set("next", path + request.nextUrl.search);
-    return NextResponse.redirect(url);
-  }
-
-  return supabaseResponse;
 }
