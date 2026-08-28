@@ -17,7 +17,20 @@ export async function GET(req: NextRequest) {
   const q = normalizeQuery(req.nextUrl.searchParams.get("q") ?? "");
   if (q.length < 2) return NextResponse.json({ results: [] });
 
-  const supabase = createServiceClient();
+  // createServiceClient() throws if SUPABASE_SERVICE_ROLE_KEY isn't set —
+  // catch it here so the login combobox degrades to "no results" instead of
+  // a bare 500 with no body, and the real reason lands in Vercel's logs.
+  let supabase;
+  try {
+    supabase = createServiceClient();
+  } catch (err) {
+    console.error("[handoff] /api/roster-lookup: could not create service client:", err);
+    return NextResponse.json(
+      { results: [], error: "Server misconfigured — see logs" },
+      { status: 500 }
+    );
+  }
+
   const isPgidLike = /^\d+$/.test(q);
 
   const query = supabase
@@ -30,6 +43,7 @@ export async function GET(req: NextRequest) {
     : await query.ilike("name", `%${q}%`);
 
   if (error) {
+    console.error("[handoff] /api/roster-lookup: query error:", error.message);
     return NextResponse.json({ results: [], error: error.message }, { status: 500 });
   }
 
