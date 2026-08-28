@@ -3,6 +3,38 @@ import { NextResponse, type NextRequest } from "next/server";
 
 type CookieToSet = { name: string; value: string; options?: CookieOptions };
 
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+function isPublicPath(path: string) {
+  return (
+    path === "/" ||
+    path.startsWith("/login") ||
+    path.startsWith("/auth") ||
+    path.startsWith("/i/") ||
+    path.startsWith("/w/") ||
+    path.startsWith("/u/") ||
+    path.startsWith("/manifest") ||
+    path.startsWith("/api/roster-lookup") ||
+    path.startsWith("/_next")
+  );
+}
+
+// Used only when Supabase can't be reached/configured at all: let public
+// pages render as "logged out" instead of hard-crashing the entire site
+// (every route, public or not, would 500 otherwise), and bounce protected
+// pages to /login rather than showing a raw MIDDLEWARE_INVOCATION_FAILED.
+function middlewareBypass(request: NextRequest) {
+  const path = request.nextUrl.pathname;
+  if (isPublicPath(path)) {
+    return NextResponse.next({ request });
+  }
+  const url = request.nextUrl.clone();
+  url.pathname = "/login";
+  url.searchParams.set("next", path + request.nextUrl.search);
+  return NextResponse.redirect(url);
+}
+
 /**
  * Refreshes the Supabase auth session on every request. This is what makes
  * "log in once" actually stick — without it, an expired access token would
@@ -11,10 +43,27 @@ type CookieToSet = { name: string; value: string; options?: CookieOptions };
 export async function updateSession(request: NextRequest) {
   let supabaseResponse = NextResponse.next({ request });
 
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
+  // Fail loud-but-not-fatal: if the env vars are missing or malformed at
+  // runtime, log exactly which one so it shows up in Vercel's Function
+  // Logs, and fail OPEN (treat the visitor as logged out) instead of
+  // throwing and taking down every single page on the site, including
+  // public ones. Remember NEXT_PUBLIC_* values are baked in at BUILD time —
+  // changing them in the Vercel dashboard does nothing until you redeploy
+  // with build cache OFF.
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    console.error(
+      "[handoff] Supabase env vars missing/empty at build time — " +
+        `NEXT_PUBLIC_SUPABASE_URL=${SUPABASE_URL ? "set" : "MISSING"}, ` +
+        `NEXT_PUBLIC_SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY ? "set" : "MISSING"}. ` +
+        "Fix in Vercel -> Settings -> Environment Variables (scope: Production), " +
+        "then redeploy with 'Use existing Build Cache' UNCHECKED."
+    );
+    return middlewareBypass(request);
+  }
+
+  let supabase;
+  try {
+    supabase = createServerClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       cookies: {
         getAll() {
           return request.cookies.getAll();
@@ -29,26 +78,19 @@ export async function updateSession(request: NextRequest) {
           );
         },
       },
-    }
-  );
+    });
+  } catch (err) {
+    console.error("[handoff] createServerClient() threw in middleware:", err);
+    return middlewareBypass(request);
+  }
 
   const {
     data: { user },
   } = await supabase.auth.getUser();
 
   const path = request.nextUrl.pathname;
-  const isPublic =
-    path === "/" ||
-    path.startsWith("/login") ||
-    path.startsWith("/auth") ||
-    path.startsWith("/i/") ||
-    path.startsWith("/w/") ||
-    path.startsWith("/u/") ||
-    path.startsWith("/manifest") ||
-    path.startsWith("/api/roster-lookup") ||
-    path.startsWith("/_next");
 
-  if (!user && !isPublic) {
+  if (!user && !isPublicPath(path)) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
     url.searchParams.set("next", path + request.nextUrl.search);
